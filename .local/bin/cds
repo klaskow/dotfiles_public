@@ -1,0 +1,52 @@
+#!/usr/bin/env zsh
+
+hydrate() {
+  local session="$1"
+  local dir="$2"
+
+  if [[ -f "$dir/.tmux-automatizer.local" ]]; then
+    tmux send-keys -t "$session" "source $dir/.tmux-automatizer.local; clear" Enter
+  elif [[ -f "$HOME/.tmux-automatizer.global" ]]; then
+    tmux send-keys -t "$session" "source $HOME/.tmux-automatizer.global; clear" Enter
+  fi
+}
+
+goto_session() {
+  local selected="$1"
+  local selected_name; selected_name=$(basename "$selected" | tr . _)
+  local is_new=0
+
+  if ! tmux has-session -t="$selected_name" 2>/dev/null; then
+    tmux new-session -ds "$selected_name" -c "$selected"
+    is_new=1
+  fi
+
+  if [[ $is_new -eq 1 ]]; then
+    hydrate "$selected_name" "$selected"
+  fi
+
+  local session_id; session_id=$(tmux list-sessions -F "#{session_name} #{session_id}" | grep "^$selected_name " | awk '{print $2}')
+
+  if [[ -z $TMUX ]]; then
+    exec tmux attach-session -t "$session_id"
+  else
+    exec tmux switch-client -t "$session_id"
+  fi
+}
+
+case "${1:-}" in
+  .)
+    local selected; selected=$(find "$PWD" -mindepth 1 -maxdepth 1 -type d | fzf)
+    [[ -z $selected ]] && exit 0
+    goto_session "$selected"
+    ;;
+  f)
+    local selected; selected=$(zoxide query -l | fzf --no-sort)
+    [[ -z $selected ]] && exit 0
+    zoxide add "$selected"
+    goto_session "$selected"
+    ;;
+  *)
+    goto_session "$PWD"
+    ;;
+esac

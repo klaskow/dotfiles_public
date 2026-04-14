@@ -1,0 +1,3 @@
+# Files listed here are intentionally tracked in both repos.
+# private version is expected to be a superset of the public one.
+.config/git/ignore

@@ -1,0 +1,36 @@
+#!/usr/bin/env zsh
+
+# Usage examples:
+#   notes              → today
+#   notes today        → today
+#   notes yesterday    → yesterday
+#   notes tomorrow     → tomorrow
+#   notes 2026-04-10   → specific date (YYYY-MM-DD)
+
+case "${1:-today}" in
+  today)     d=$(date +%F) ;;
+  yesterday) d=$(date -d yesterday +%F) ;;
+  tomorrow)  d=$(date -d tomorrow +%F) ;;
+  *)         d="$1" ;;
+esac
+
+dir=~/Notes/Journals/$d
+file=$dir/$d.md
+
+mkdir -p "$dir"
+
+[[ -f "$file" ]] || cat > "$file" <<EOF
+# 🗓️ $d
+
+## 🧑‍💻 NOW
+
+## 📝 NOTES
+
+## 📌 TODO
+
+## ❓Q&A
+
+## ⏭️ NEXT
+EOF
+
+nvim "$file"
