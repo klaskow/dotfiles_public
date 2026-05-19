@@ -1,0 +1,871 @@
+#!/usr/bin/env zsh
+# dotfiles — manages files from dotfiles_public and dotfiles_private repos
+# Each file in the repo maps 1:1 to ~/
+#
+# Usage: dotfiles <public|private> <command> [args]
+
+set -euo pipefail
+
+#
+# Constants
+#
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[1;33m'
+BLUE=$'\033[0;34m'
+CYAN=$'\033[0;36m'
+BOLD=$'\033[1m'
+NC=$'\033[0m'
+
+DOTFILES_DIR="${DOTFILES_DIR:-$HOME/.dotfiles}"
+
+typeset -gi G_COPIED=0 G_SKIPPED=0 G_BACKED_UP=0
+typeset -gi G_OK=1
+typeset -gi G_REPLACE_DECLINED=0
+typeset -gi G_REPLACE_DECLINED_FILES=0
+typeset -a  IGNORE_PATTERNS
+typeset -a  ALLOW_OVERRIDES
+typeset -a  REPLACE_PATHS
+
+#
+# Entry point
+#
+
+main() {
+    case "${1:-}" in
+        public|private)
+            REPO_NAME="$1"; shift
+            REPO_DIR="$DOTFILES_DIR/dotfiles_${REPO_NAME}"
+            IGNORE_FILE="$REPO_DIR/.dotfiles-ignore"
+            ALLOW_OVERRIDE_FILE="$REPO_DIR/.dotfiles-allow-override"
+            REPLACE_FILE="$REPO_DIR/.dotfiles-replace"
+            MARKER="# DOTFILES-MANAGED"
+            ;;
+        help|--help|-h)
+            cmd_help; return
+            ;;
+        *)
+            echo "${BOLD}Usage:${NC} dotfiles <public|private> <command> [args]"
+            echo "       dotfiles help"
+            echo ""
+            echo "Repos:"
+            echo "  public   ${DOTFILES_DIR}/dotfiles_public"
+            echo "  private  ${DOTFILES_DIR}/dotfiles_private"
+            [[ -n "${1:-}" ]] && { echo ""; die "Unknown repo: $1" }
+            return 0
+            ;;
+    esac
+
+    case "${1:-}" in
+        apply)   shift;    cmd_apply   "$@" ;;
+        save)    shift;    cmd_save    "$@" ;;
+        edit)    shift;    cmd_edit    "$@" ;;
+        diff)              cmd_diff        ;;
+        status)            cmd_status      ;;
+        doctor)            cmd_doctor      ;;
+        help|--help|-h|"") cmd_help        ;;
+        *)
+            die "Unknown command: $1\nRun 'dotfiles help' for usage."
+            ;;
+    esac
+}
+
+#
+# Commands
+#
+
+cmd_apply() {
+    local dry_run=0
+    [[ "${1:-}" == "--dry-run" ]] && dry_run=1
+
+    require_repo
+    load_ignore_patterns
+    load_replace_paths
+
+    (( dry_run )) \
+        && header "Dry run — no files will be changed" \
+        || header "Applying from ${CYAN}${REPO_DIR}${NC}"
+    echo ""
+
+    G_COPIED=0; G_SKIPPED=0; G_BACKED_UP=0
+    G_REPLACE_DECLINED=0; G_REPLACE_DECLINED_FILES=0
+
+    apply_replace_dirs "$dry_run"
+
+    local files=("${(@f)$(list_repo_files)}")
+    for rel in "${files[@]}"; do
+        [[ -z "$rel" ]] && continue
+        apply_one_file "$rel" "$dry_run"
+    done
+
+    echo ""
+    if (( dry_run )); then
+        header "Would copy: ${GREEN}${G_COPIED}${NC}  Would skip: ${BLUE}${G_SKIPPED}${NC}"
+    elif (( G_REPLACE_DECLINED > 0 )); then
+        header "Done. Copied: ${GREEN}${G_COPIED}${NC}  Skipped: ${BLUE}${G_SKIPPED}${NC} (replace declined: ${G_REPLACE_DECLINED}, files: ${G_REPLACE_DECLINED_FILES})  Backed up: ${YELLOW}${G_BACKED_UP}${NC}"
+    else
+        header "Done. Copied: ${GREEN}${G_COPIED}${NC}  Skipped: ${BLUE}${G_SKIPPED}${NC}  Backed up: ${YELLOW}${G_BACKED_UP}${NC}"
+    fi
+}
+
+cmd_save() {
+    require_repo
+    load_ignore_patterns
+    load_allow_overrides
+
+    if [[ $# -gt 0 ]]; then
+        local rel
+        rel="$(resolve_rel "$1")"
+
+        if ! repo_file_exists "$rel"; then
+            save_new_file "$rel"
+        elif repo_matches_home "$rel"; then
+            echo "${BLUE}No changes — file identical to repo.${NC}"
+        else
+            save_modified_file "$rel"
+        fi
+        return
+    fi
+
+    header "Checking for changes on machine vs repo..."
+    echo ""
+
+    local found_changes=0
+    local files=("${(@f)$(list_repo_files)}")
+    for rel in "${files[@]}"; do
+        [[ -z "$rel" ]] && continue
+        home_file_exists  "$rel" || continue
+        repo_matches_home "$rel" && continue
+        found_changes=1
+        prompt_save_to_repo "$rel"
+    done
+
+    (( found_changes )) || echo "  ${GREEN}All files identical.${NC}"
+    echo ""
+    header "Done."
+}
+
+cmd_diff() {
+    require_repo
+    load_ignore_patterns
+    load_replace_paths
+
+    header "Comparing ~/  ↔  ${CYAN}${REPO_DIR/#$HOME/~}${NC}"
+    echo ""
+
+    local modified=0 missing=0 ok=0 dst
+    local files=("${(@f)$(list_repo_files)}")
+
+    # Replace dirs first — each shown as a labelled group with indented file states
+    for replace_rel in "${REPLACE_PATHS[@]}"; do
+        local rdst
+        rdst="$(target_path "$replace_rel")"
+        echo "  ${RED}REPLACE${NC}  ${rdst/#$HOME/~}  (listed in .dotfiles-replace)"
+        for rel in "${files[@]}"; do
+            [[ -z "$rel" ]] && continue
+            [[ "$rel" == "$replace_rel" || "$rel" == "$replace_rel/"* ]] || continue
+            dst="$(target_path "$rel")"
+            case "$(file_state "$rel")" in
+                missing)   echo "    ${RED}MISSING${NC}   ${dst/#$HOME/~}"; (( ++missing )) ;;
+                modified)  echo "    ${YELLOW}MODIFIED${NC}  ${dst/#$HOME/~}"; (( ++modified )) ;;
+                identical) echo "    ${GREEN}OK${NC}        ${dst/#$HOME/~}"; (( ++ok )) ;;
+            esac
+        done
+        echo ""
+    done
+
+    # Non-replace files
+    for rel in "${files[@]}"; do
+        [[ -z "$rel" ]] && continue
+        [[ -n "$(find_replace_parent "$rel")" ]] && continue
+        dst="$(target_path "$rel")"
+        case "$(file_state "$rel")" in
+            missing)   echo "  ${RED}MISSING${NC}   ${dst/#$HOME/~}  (in repo, not on machine)"; (( ++missing )) ;;
+            modified)  echo "  ${YELLOW}MODIFIED${NC}  ${dst/#$HOME/~}  (differs from repo)";    (( ++modified )) ;;
+            identical) echo "  ${GREEN}OK${NC}        ${dst/#$HOME/~}";                          (( ++ok )) ;;
+        esac
+    done
+
+    echo ""
+    if (( ${#REPLACE_PATHS[@]} > 0 )); then
+        header "Modified: ${YELLOW}${modified}${NC}  Missing: ${RED}${missing}${NC}  OK: ${GREEN}${ok}${NC}  Replace dirs: ${RED}${#REPLACE_PATHS[@]}${NC}"
+    else
+        header "Modified: ${YELLOW}${modified}${NC}  Missing: ${RED}${missing}${NC}  OK: ${GREEN}${ok}${NC}"
+    fi
+}
+
+cmd_status() {
+    require_repo
+    load_ignore_patterns
+    load_replace_paths
+
+    local modified=0 missing=0 ok=0
+    local files=("${(@f)$(list_repo_files)}")
+    for rel in "${files[@]}"; do
+        [[ -z "$rel" ]] && continue
+        case "$(file_state "$rel")" in
+            missing)   (( ++missing )) ;;
+            modified)  (( ++modified )) ;;
+            identical) (( ++ok )) ;;
+        esac
+    done
+
+    local line="${YELLOW}${modified}${NC} modified, ${RED}${missing}${NC} missing, ${GREEN}${ok}${NC} ok"
+
+    if (( ${#REPLACE_PATHS[@]} > 0 )); then
+        local replace_info=""
+        for replace_rel in "${REPLACE_PATHS[@]}"; do
+            local count
+            count="$(count_replace_files "$replace_rel")"
+            replace_info+="${replace_rel} (${count} files), "
+        done
+        line+="  |  replace: ${replace_info%, }"
+    fi
+
+    header "$line"
+}
+
+cmd_doctor() {
+    require_repo
+    load_ignore_patterns
+    load_allow_overrides
+    load_replace_paths
+
+    G_OK=1
+    header "Doctor"
+    echo ""
+
+    doctor_check_repo
+    doctor_check_ignore_file
+    doctor_check_replace
+    doctor_check_bin_permissions
+    doctor_check_conflicts
+
+    echo ""
+    if (( G_OK )); then
+        header "${GREEN}All checks passed.${NC}"
+    else
+        header "${RED}Issues found.${NC}"
+        return 1
+    fi
+}
+
+cmd_edit() {
+    [[ $# -eq 0 ]] && die "Usage: dotfiles ${REPO_NAME} edit <path>"
+    require_repo
+
+    local rel
+    rel="$(resolve_rel "$1")"
+    if ! repo_file_exists "$rel"; then
+        echo "${RED}Not tracked in repo: ${rel}${NC}" >&2
+        die "Use 'dotfiles ${REPO_NAME} save' to add it first."
+    fi
+    "${EDITOR:-vi}" "$REPO_DIR/$rel"
+}
+
+cmd_help() {
+    cat <<EOF
+${BOLD}dotfiles${NC} — manage dotfiles repos
+
+${BOLD}Usage:${NC}
+  dotfiles <public|private> <command> [args]
+
+${BOLD}Commands:${NC}
+  apply [--dry-run]    Copy files from repo → ~/
+  save [path]          Copy file(s) from ~/ → repo (adds new, updates existing)
+  edit <path>          Open file from repo in \$EDITOR
+  diff                 Show differences between machine and repo
+  status               Short summary of changes
+  doctor               Check repo health (permissions, conflicts)
+  help                 Show this help
+
+${BOLD}Repos:${NC}
+  public   ${DOTFILES_DIR}/dotfiles_public
+  private  ${DOTFILES_DIR}/dotfiles_private
+
+${BOLD}Control files:${NC}
+  .dotfiles-ignore         Patterns to skip during apply/diff/status
+  .dotfiles-allow-override Paths allowed to exist in both repos
+  .dotfiles-replace        Dirs/files to wipe and replace wholesale on apply
+
+${BOLD}Mapping:${NC}  * → ~/*  (pure 1:1)
+
+${BOLD}Examples:${NC}
+  dotfiles public apply
+  dotfiles public apply --dry-run
+  dotfiles public save ~/.zshrc.public
+  dotfiles public save ~/.config/alacritty/alacritty.toml
+  dotfiles public edit ~/.zshrc.public
+  dotfiles private diff
+EOF
+}
+
+#
+# Apply handlers
+#
+
+# Copy new file from repo to home. Skips the copy in dry-run mode.
+on_apply_new() {
+    local rel="$1" dry_run="$2"
+    local dst
+    dst="$(target_path "$rel")"
+    echo "  ${GREEN}COPY${NC}     ${rel} → ${dst/#$HOME/~}"
+    if ! (( dry_run )); then
+        copy_to_home "$rel"
+    fi
+    (( ++G_COPIED ))
+}
+
+# Skip file that is identical between repo and home.
+on_apply_identical() {
+    echo "  ${BLUE}SKIP${NC}     ${1} (identical)"
+    (( ++G_SKIPPED ))
+}
+
+# Skip .zshrc that exists on machine but lacks the DOTFILES-MANAGED marker.
+on_apply_protected() {
+    echo "  ${YELLOW}PROTECT${NC}  ${1} (no DOTFILES-MANAGED marker, skipping)"
+    (( ++G_SKIPPED ))
+}
+
+# Show diff for a modified file, then ask to overwrite. Skips the prompt in dry-run.
+on_apply_modified() {
+    local rel="$1" dry_run="$2"
+    local dst
+    dst="$(target_path "$rel")"
+    echo ""; echo "  ${YELLOW}MODIFIED${NC}  ${dst/#$HOME/~}"
+    show_diff "$dst" "$REPO_DIR/$rel"
+    echo ""
+
+    if (( dry_run )); then
+        (( ++G_COPIED ))
+        return
+    fi
+
+    if confirm "  Overwrite?"; then
+        backup_home_file "$rel"
+        copy_to_home "$rel"
+        echo "  ${GREEN}COPY${NC}     ${rel}"
+        (( ++G_COPIED ))
+        (( ++G_BACKED_UP ))
+    else
+        echo "  ${BLUE}SKIP${NC}     ${rel}"
+        (( ++G_SKIPPED ))
+    fi
+}
+
+# Route a single file to the appropriate apply handler based on its state.
+apply_one_file() {
+    local rel="$1" dry_run="$2"
+    case "$(file_state "$rel")" in
+        missing)   on_apply_new       "$rel" "$dry_run" ;;
+        identical) on_apply_identical "$rel" ;;
+        modified)
+            is_protected_zshrc "$rel" \
+                && on_apply_protected "$rel" \
+                || on_apply_modified  "$rel" "$dry_run"
+            ;;
+    esac
+}
+
+#
+# Apply replace handlers
+#
+
+# Handle all .dotfiles-replace entries before the per-file loop.
+# Confirmed dir replaces: backup + rm -rf, then apply_one_file copies files as "missing".
+# Confirmed file replaces: backup + copy inline, added to IGNORE_PATTERNS to skip in loop.
+# Declined replaces: added to IGNORE_PATTERNS so the per-file loop skips them entirely.
+# Nested entries (child under another replace entry) are skipped as redundant.
+apply_replace_dirs() {
+    local dry_run="$1"
+    [[ ${#REPLACE_PATHS[@]} -eq 0 ]] && return
+
+    for replace_rel in "${REPLACE_PATHS[@]}"; do
+        # Skip nested entries — parent already handles the whole subtree
+        local is_nested=0
+        for other in "${REPLACE_PATHS[@]}"; do
+            [[ "$other" == "$replace_rel" ]] && continue
+            [[ "$replace_rel" == "$other/"* ]] && { is_nested=1; break }
+        done
+        (( is_nested )) && continue
+
+        local dst
+        dst="$(target_path "$replace_rel")"
+        local exists=0
+        { [[ -d "$dst" ]] || [[ -f "$dst" ]]; } && exists=1
+
+        if ! (( exists )); then
+            (( dry_run )) && echo "  ${RED}REPLACE${NC}  ${dst/#$HOME/~}  (dry run — not present, would copy fresh)"
+            continue
+        fi
+
+        echo "  ${RED}REPLACE${NC}  ${dst/#$HOME/~}"
+
+        if (( dry_run )); then
+            echo "  (dry run — would delete and replace)"
+            echo ""
+            continue
+        fi
+
+        if confirm "  Delete ${dst/#$HOME/~} and replace with repo version?"; then
+            if [[ -d "$dst" ]]; then
+                backup_home_dir "$replace_rel"
+                rm -rf "$dst"
+                echo "  ${RED}DELETED${NC}  ${dst/#$HOME/~}"
+                local replace_files=()
+                while IFS= read -r -d '' f; do
+                    replace_files+=("${f#$REPO_DIR/}")
+                done < <(find "$REPO_DIR/$replace_rel" -type f -print0 2>/dev/null | sort -z)
+                local file_count=0
+                for rf in "${replace_files[@]}"; do
+                    [[ -z "$rf" ]] && continue
+                    local rf_dst
+                    rf_dst="$(target_path "$rf")"
+                    echo "  ${GREEN}COPY${NC}     ${rf} → ${rf_dst/#$HOME/~}"
+                    copy_to_home "$rf"
+                    (( ++G_COPIED ))
+                    (( ++file_count ))
+                done
+                echo "  ${GREEN}COPIED${NC}   ${file_count} files → ${dst/#$HOME/~}/"
+                IGNORE_PATTERNS+=("${replace_rel}/")
+            else
+                backup_home_file "$replace_rel"
+                rm -f "$dst"
+                copy_to_home "$replace_rel"
+                echo "  ${GREEN}REPLACED${NC} ${dst/#$HOME/~}"
+                IGNORE_PATTERNS+=("$replace_rel")
+                (( ++G_COPIED ))
+            fi
+        else
+            local file_count
+            file_count="$(count_replace_files "$replace_rel")"
+            echo "  ${BLUE}SKIP${NC}     ${dst/#$HOME/~} (replace declined)"
+            [[ -d "$dst" ]] && IGNORE_PATTERNS+=("${replace_rel}/") || IGNORE_PATTERNS+=("$replace_rel")
+            (( ++G_REPLACE_DECLINED ))
+            (( G_REPLACE_DECLINED_FILES += file_count ))
+        fi
+        echo ""
+    done
+}
+
+#
+# Save handlers
+#
+
+# Guard against cross-repo conflict, then copy the file into the repo.
+save_new_file() {
+    check_conflict "$1"
+    add_to_repo "$1"
+}
+
+# Show diff for a single tracked file and ask to save back to repo.
+save_modified_file() {
+    header "Diff for ${CYAN}${1}${NC}:"
+    echo ""
+    show_diff "$REPO_DIR/$1" "$(target_path "$1")"
+    echo ""
+    if confirm "Save to repo?"; then
+        copy_to_repo "$1"
+        echo "${GREEN}Saved${NC} ${1}"
+    else
+        echo "Skipped."
+    fi
+}
+
+# Show diff for a file found during the all-files scan and ask to save back to repo.
+prompt_save_to_repo() {
+    echo "  ${YELLOW}MODIFIED${NC}  ${1}"
+    echo ""
+    show_diff "$REPO_DIR/$1" "$(target_path "$1")"
+    echo ""
+    if confirm "  Save back to repo?"; then
+        copy_to_repo "$1"
+        echo "  ${GREEN}Saved${NC}    ${1}"
+    fi
+}
+
+#
+# Doctor handlers
+#
+
+# Print a green check with a message.
+doctor_pass() { echo "  ${GREEN}✓${NC}  $1" }
+# Print a yellow warning with a message (does not affect G_OK).
+doctor_warn() { echo "  ${YELLOW}!${NC}  $1" }
+# Print a red failure with a message and mark the doctor run as failed.
+doctor_fail() { echo "  ${RED}✗${NC}  $1"; G_OK=0 }
+
+# Verify the repo directory exists on disk.
+doctor_check_repo() {
+    if [[ -d "$REPO_DIR" ]]; then
+        doctor_pass "Repo exists: ${REPO_DIR/#$HOME/~}"
+    else
+        doctor_fail "Repo missing: ${REPO_DIR/#$HOME/~}"
+    fi
+}
+
+# Warn if .dotfiles-ignore is absent (not required, but expected).
+doctor_check_ignore_file() {
+    if [[ -f "$IGNORE_FILE" ]]; then
+        doctor_pass ".dotfiles-ignore exists"
+    else
+        doctor_warn ".dotfiles-ignore missing (optional)"
+    fi
+}
+
+# Verify every file in .local/bin/ has the executable bit set.
+doctor_check_bin_permissions() {
+    local bin_dir="$REPO_DIR/.local/bin"
+    [[ ! -d "$bin_dir" ]] && return
+    while IFS= read -r -d '' f; do
+        local name="${f/#$REPO_DIR\//}"
+        if [[ -x "$f" ]]; then
+            doctor_pass "$name is executable"
+        else
+            doctor_fail "$name missing +x"
+        fi
+    done < <(find "$bin_dir" -type f -print0)
+}
+
+# Report every path listed in .dotfiles-replace and verify it exists in the repo.
+# Warns about nested entries (child under another replace entry) as redundant.
+doctor_check_replace() {
+    [[ ! -f "$REPLACE_FILE" ]] && return
+    if [[ ${#REPLACE_PATHS[@]} -eq 0 ]]; then
+        doctor_warn ".dotfiles-replace exists but is empty"
+        return
+    fi
+
+    for replace_rel in "${REPLACE_PATHS[@]}"; do
+        local is_nested=0
+        for other in "${REPLACE_PATHS[@]}"; do
+            [[ "$other" == "$replace_rel" ]] && continue
+            [[ "$replace_rel" == "$other/"* ]] && { is_nested=1; break }
+        done
+        if (( is_nested )); then
+            doctor_warn "Replace: ${replace_rel} is nested under another replace entry — redundant"
+            continue
+        fi
+
+        if [[ -d "$REPO_DIR/$replace_rel" ]]; then
+            local count
+            count="$(count_replace_files "$replace_rel")"
+            doctor_pass "Replace: ${replace_rel}  (directory, ${count} files — will wipe ~/${replace_rel} on apply)"
+        elif [[ -f "$REPO_DIR/$replace_rel" ]]; then
+            doctor_pass "Replace: ${replace_rel}  (file — will replace ~/${replace_rel} on apply)"
+        else
+            doctor_fail "Replace: ${replace_rel} listed in .dotfiles-replace but not found in repo"
+        fi
+    done
+}
+
+# Detect files that exist in both repos, which would cause apply conflicts.
+# Files listed in .dotfiles-allow-override are reported as intentional overlaps, not errors.
+doctor_check_conflicts() {
+    local other
+    other="$(other_repo_dir)"
+    [[ ! -d "$other" ]] && return
+
+    local found=0
+    local files=("${(@f)$(list_repo_files)}")
+    for rel in "${files[@]}"; do
+        [[ -z "$rel" ]] && continue
+        if [[ -e "$other/$rel" ]]; then
+            if is_allowed_override "$rel"; then
+                doctor_pass "Overlap allowed: ${rel}"
+            else
+                doctor_fail "Conflict: ${rel} exists in both repos"
+                found=1
+            fi
+        fi
+    done
+    (( found )) || doctor_pass "No cross-repo conflicts"
+}
+
+#
+# File predicates
+#
+
+# True if the file's home destination exists on this machine.
+home_file_exists() { [[ -f "$(target_path "$1")" ]] }
+
+# True if the file exists in the repo.
+repo_file_exists() { [[ -e "$REPO_DIR/$1" ]] }
+
+# True if the repo copy and home copy are byte-for-byte identical.
+repo_matches_home() { cmp -s "$REPO_DIR/$1" "$(target_path "$1")" }
+
+# True if the first line of a file contains the DOTFILES-MANAGED marker.
+is_managed() { head -1 "$1" | grep -qF "$MARKER" }
+
+# True if the file is .zshrc AND the home copy lacks the managed marker.
+# Prevents accidentally overwriting a user's existing .zshrc.
+is_protected_zshrc() { [[ "$1" == ".zshrc" ]] && ! is_managed "$(target_path "$1")" }
+
+# Return the sync state of a file: "missing", "identical", or "modified".
+file_state() {
+    home_file_exists  "$1" || { echo "missing";  return }
+    repo_matches_home "$1" && { echo "identical"; return }
+    echo "modified"
+}
+
+#
+# File operations
+#
+
+# Copy a file from repo to its home destination, creating parent dirs as needed.
+# Uses a temp file + mv so the replacement is atomic — safe even when applying this
+# script itself (zsh holds the old inode open and is unaffected by the rename).
+# Preserves the executable bit from the repo file.
+copy_to_home() {
+    local dst tmp
+    dst="$(target_path "$1")"
+    tmp="${dst}.tmp.$$"
+    mkdir -p "${dst:h}"
+    cp "$REPO_DIR/$1" "$tmp"
+    [[ -x "$REPO_DIR/$1" ]] && chmod +x "$tmp"
+    mv "$tmp" "$dst"
+}
+
+# Back up the home copy of a file with a timestamp suffix, then print a notice.
+backup_home_file() {
+    local dst ts bak
+    dst="$(target_path "$1")"
+    ts="$(date +%Y-%m-%d_%H-%M-%S)"
+    bak="${dst}.bak.${ts}"
+    cp "$dst" "$bak"
+    echo "  ${YELLOW}BACKUP${NC}   ${bak/#$HOME/~}"
+}
+
+# Back up the home copy of a directory with a timestamp suffix, then print a notice.
+backup_home_dir() {
+    local dst ts bak
+    dst="$(target_path "$1")"
+    ts="$(date +%Y-%m-%d_%H-%M-%S)"
+    bak="${dst}.bak.${ts}"
+    cp -r "$dst" "$bak"
+    echo "  ${YELLOW}BACKUP${NC}   ${bak/#$HOME/~}"
+}
+
+# Copy the home copy of a file or directory back into the repo.
+copy_to_repo() {
+    local src
+    src="$(target_path "$1")"
+    if [[ -d "$src" ]]; then
+        cp -r "$src/." "$REPO_DIR/$1/"
+    else
+        cp "$src" "$REPO_DIR/$1"
+    fi
+}
+
+# Copy a file or directory from home into the repo for the first time.
+add_to_repo() {
+    local src
+    src="$(target_path "$1")"
+    local dest="$REPO_DIR/$1"
+    if [[ -d "$src" ]]; then
+        mkdir -p "$dest"
+        cp -r "$src/." "$dest/"
+        echo "${GREEN}Added${NC} ${1}/ (directory)"
+    else
+        mkdir -p "${dest:h}"
+        cp "$src" "$dest"
+        echo "${GREEN}Added${NC} ${1}"
+    fi
+}
+
+#
+# Repo
+#
+
+# Exit with an error if the repo directory does not exist.
+require_repo() { [[ -d "$REPO_DIR" ]] || die "Repo does not exist: $REPO_DIR" }
+
+# Return the path to the repo that is not currently active.
+other_repo_dir() {
+    case "$REPO_NAME" in
+        public)  echo "$DOTFILES_DIR/dotfiles_private" ;;
+        private) echo "$DOTFILES_DIR/dotfiles_public"  ;;
+    esac
+}
+
+# Exit with an error if the given rel path already exists in the other repo.
+# Files listed in .dotfiles-allow-override are exempt.
+check_conflict() {
+    if is_allowed_override "$1"; then
+        return 0
+    fi
+    local other
+    other="$(other_repo_dir)"
+    if [[ -e "$other/$1" ]]; then
+        die "Conflict: $1 already exists in ${other/$DOTFILES_DIR\//}"
+    fi
+}
+
+# Return true if rel is a dotfiles control file that must never be copied to ~/.
+is_control_file() {
+    case "$1" in
+        .dotfiles-ignore|.dotfiles-allow-override|.dotfiles-replace) return 0 ;;
+    esac
+    return 1
+}
+
+# List all files in the repo, excluding control files and paths matched by .dotfiles-ignore.
+list_repo_files() {
+    while IFS= read -r -d '' file; do
+        local rel="${file#$REPO_DIR/}"
+        is_control_file "$rel" && continue
+        should_ignore "$rel" || echo "$rel"
+    done < <(find "$REPO_DIR" -type f -print0 2>/dev/null) | sort
+}
+
+#
+# Path mapping
+#
+
+# Expand ~ and resolve relative paths to an absolute path.
+normalize_path() {
+    local path="${1/#~/$HOME}"
+    [[ "$path" != /* ]] && path="$PWD/$path"
+    echo "$path"
+}
+
+# Map a repo-relative path to its destination under ~/ (pure 1:1 mapping).
+target_path() { echo "$HOME/$1" }
+
+# Map an absolute home path back to a repo-relative path.
+# Returns empty string if the path is outside ~/.
+repo_rel_path() {
+    local p="$1"
+    [[ "$p" == "$HOME/"* ]] && echo "${p#$HOME/}" || echo ""
+}
+
+# Normalize a user-supplied path and convert it to a repo-relative path.
+# Exits with an error if the path does not exist or cannot be mapped.
+resolve_rel() {
+    local path
+    path="$(normalize_path "$1")"
+    [[ ! -e "$path" ]] && die "Does not exist: $path"
+    local rel
+    rel="$(repo_rel_path "$path")"
+    [[ -z "$rel" ]] && die "Cannot map: $path (must be under ~/)"
+    echo "$rel"
+}
+
+#
+# Replace paths
+#
+
+# Read .dotfiles-replace and populate REPLACE_PATHS, skipping blank lines and comments.
+# Trailing slashes are stripped for consistency with repo-relative paths.
+load_replace_paths() {
+    REPLACE_PATHS=()
+    [[ ! -f "$REPLACE_FILE" ]] && return
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        REPLACE_PATHS+=("${line%/}")
+    done < "$REPLACE_FILE"
+}
+
+# Return the replace entry that is a parent of the given repo-relative path, or empty string.
+find_replace_parent() {
+    local rel="$1"
+    for p in "${REPLACE_PATHS[@]}"; do
+        [[ "$rel" == "$p" || "$rel" == "$p/"* ]] && { echo "$p"; return }
+    done
+    echo ""
+}
+
+# Count files under a replace entry in the repo (used for declined-replace reporting).
+count_replace_files() {
+    find "$REPO_DIR/$1" -type f 2>/dev/null | wc -l | tr -d ' \t'
+}
+
+#
+# Allow-override patterns
+#
+
+# Read .dotfiles-allow-override and populate ALLOW_OVERRIDES, skipping blank lines and comments.
+load_allow_overrides() {
+    ALLOW_OVERRIDES=()
+    [[ ! -f "$ALLOW_OVERRIDE_FILE" ]] && return
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        ALLOW_OVERRIDES+=("$line")
+    done < "$ALLOW_OVERRIDE_FILE"
+}
+
+# Return true if a repo-relative path is explicitly allowed to exist in both repos.
+is_allowed_override() {
+    local rel="$1"
+    for p in "${ALLOW_OVERRIDES[@]}"; do
+        [[ "$rel" == "$p" ]] && return 0
+    done
+    return 1
+}
+
+#
+# Ignore patterns
+#
+
+# Read .dotfiles-ignore and populate IGNORE_PATTERNS, skipping blank lines and comments.
+load_ignore_patterns() {
+    IGNORE_PATTERNS=()
+    [[ ! -f "$IGNORE_FILE" ]] && return
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        IGNORE_PATTERNS+=("$line")
+    done < "$IGNORE_FILE"
+}
+
+# Return true if a repo-relative path matches any pattern in IGNORE_PATTERNS.
+# Supports directory patterns (trailing /), glob patterns (*), and exact matches.
+should_ignore() {
+    local rel_path="$1" basename="${1:t}"
+    for pattern in "${IGNORE_PATTERNS[@]}"; do
+        if [[ "$pattern" == */ ]]; then
+            local dir="${pattern%/}"
+            [[ "$rel_path" == "$dir"/* || "$rel_path" == */"$dir"/* || "$rel_path" == "$dir" ]] && return 0
+        elif [[ "$pattern" == *\** ]]; then
+            [[ "$basename" == ${~pattern} ]] && return 0
+        else
+            [[ "$basename" == "$pattern" || "$rel_path" == "$pattern" ]] && return 0
+        fi
+    done
+    return 1
+}
+
+#
+# Output
+#
+
+# Print an error message to stderr and exit with code 1.
+die() { echo "${RED}${1}${NC}" >&2; exit 1 }
+
+# Print a [dotfiles-REPO] prefixed message.
+header() { echo "${BOLD}[dotfiles-${REPO_NAME}]${NC} $1" }
+
+# Prompt with [y/N] and return 0 if the user answers y or Y.
+confirm() {
+    echo -n "$1 [y/N] "
+    local ans
+    read -rk1 ans
+    echo ""
+    [[ "$ans" == [yY] ]]
+}
+
+# Show a coloured diff between two files or directories. Always returns 0 (diff exits 1 when files differ).
+show_diff() {
+    if [[ -d "$1" ]]; then
+        diff -r --color=auto "$1" "$2" || true
+    else
+        diff --color=auto "$1" "$2" || true
+    fi
+}
+
+#
+# Run
+#
+
+main "$@"

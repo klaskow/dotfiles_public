@@ -1,0 +1,13 @@
+#!/usr/bin/env zsh
+
+SESSION=$(tmux display-message -p '#S')
+DIR=$(tmux display-message -p '#{pane_current_path}')
+
+[[ ! -f "$DIR/package.json" ]] && return 0
+
+tmux send-keys -t "$SESSION:1" 'jq -C "{dependencies,devDependencies,scripts}" package.json' Enter
+tmux send-keys -t "$SESSION:1" 'ls *lock*' Enter
+tmux new-window -d -t "$SESSION" -n "npm" -c "$DIR"
+tmux send-keys -t "$SESSION:npm" 's=$(jq -r ".scripts|keys[]?" package.json | fzf --prompt="npm run > " --height=40%); [[ -n $s ]] && npm run "$s"' Enter
+tmux new-window -d -t "$SESSION" -n "opencode" -c "$DIR"
+tmux send-keys -t "$SESSION:opencode" "opencode" Enter

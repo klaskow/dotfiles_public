@@ -1,0 +1,14 @@
+---@module 'lazy'
+---@type LazySpec
+return {
+  'SmiteshP/nvim-navic',
+  lazy = true,
+  opts = {
+    lsp = { auto_attach = false },
+    highlight = true,
+    separator = ' > ',
+    depth_limit = 0,
+    depth_limit_indicator = '..',
+    safe_output = true,
+  },
+}

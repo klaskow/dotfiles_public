@@ -1,0 +1,7 @@
+README.md
+.git/
+.gitignore
+.dotfiles-ignore
+.dotfiles-allow-override
+.dotfiles-replace
+.DS_Store
